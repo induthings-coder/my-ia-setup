@@ -33,36 +33,65 @@ The setup serves two distinct audiences from the same machine:
 │   default → Sonnet 4.6     │   │                                      │
 │   think   → Opus 4.7       │   │     OpenAI-compatible client         │
 │   long    → Opus 4.7       │   │           ↓                          │
-│   bg      → local          │   └──────────────────────┬───────────────┘
+│   bg      → local 7B coder │   └──────────────────────┬───────────────┘
+│ + plugins/                 │                          │
+│   strip-billing-header.js  │                          │
 └─────────────┬──────────────┘                          │
               │                                         │
               └─────────────────┬───────────────────────┘
                                 ▼
-                  ┌────────────────────────────────┐
-                  │ llama-swap                     │
-                  │ :8001 — model proxy            │
-                  │   on-demand spawns llama-server│
-                  │   per requested model id       │
-                  └─────────────┬──────────────────┘
-                                ▼
-                  ┌────────────────────────────────┐
-                  │ llama-server (one at a time)   │
-                  │   • Qwen2.5-14B-Instruct       │
-                  │   • Gemma-3-4B-it + mmproj     │
-                  └────────────────────────────────┘
+                  ┌────────────────────────────────────────┐
+                  │ llama-swap                             │
+                  │ :8001 — model proxy + group manager    │
+                  └─────────────┬──────────────────────────┘
+                                │
+              ┌─────────────────┼──────────────────┐
+              │ group: gpu      │ group: cpu       │
+              │ (one at a time) │ (independent)    │
+              ▼                 ▼                  ▼
+   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+   │ llama-server     │  │ llama-server     │  │ llama-server     │
+   │ Qwen2.5-Coder-7B │  │ Gemma-3-4B+mmproj│  │ DeepSeek-R1      │
+   │ (P100, default)  │  │ (P100, on demand)│  │ Distill Qwen 7B  │
+   │ ─ alt: 14B       │  │                  │  │ (CPU, reasoning) │
+   └──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
-### Why llama-swap?
+### Why llama-swap and groups
 
-A single GPU can hold one large model at a time. `llama-swap` listens on
-:8001, parses each incoming request's `model` field, starts the matching
+A single GPU holds one large model at a time. `llama-swap` listens on
+`:8001`, parses each incoming request's `model` field, starts the matching
 `llama-server` if it isn't already loaded, proxies the request, and unloads
 idle models after a configurable TTL. From the client side it looks like a
 multi-model OpenAI-compatible endpoint.
 
-This means the family can switch from "coder" (Qwen2.5-14B) to "familiar"
-(Gemma 3 with vision) directly from Open WebUI's model dropdown. No SSH,
-no scripts, no buttons.
+The `groups` block in `~/.config/llama-swap/config.yaml` makes the swap
+behavior precise: GPU models share one slot (loading any one unloads the
+others, ~5–10 s cold-load latency the first time), while the CPU model lives
+in its own group and **coexists** with the active GPU model. So you can keep
+DeepSeek-R1 resident in RAM for reasoning tasks without evicting Qwen from
+the GPU.
+
+### Why the P100 needs special care
+
+Pascal (compute capability 6.0) lacks Tensor Cores and DP4A. Quantized 14B
+models with `--flash-attn` and Q8 KV cache hit ~170 t/s prefill — fine for
+chat, painful for Claude Code prompts (28 K tokens of system + tools). The
+tuning that makes the local path usable:
+
+- **Qwen 2.5 Coder 7B** as the default local model (~430 t/s prefill,
+  ~40 t/s gen on the P100). The 7B Coder beats the 14B Instruct on code
+  benchmarks and runs 2–3× faster.
+- **`f16` KV cache and no `--flash-attn`** in the 7B's `cmd` line — both
+  Q8 KV and FA hurt on Pascal.
+- **`--cache-reuse 256` and `--parallel 1`** so the single slot accumulates
+  a long-lived KV prefix.
+- **`CLAUDE_CODE_ATTRIBUTION_HEADER=0` in the client's `settings.json`**
+  to stop the per-turn `cch=...` rotation that otherwise invalidates the
+  prefix on every turn (`prompt_n=28553, cache_n=33` regardless of how
+  long the conversation has been). With the flag set, the second turn's
+  `cache_n` matches `prompt_n` and the wall-clock drops from ~70 s to
+  ~1–3 s.
 
 ---
 
@@ -106,12 +135,23 @@ respectively before running the installer.
 | claude-code-router   | latest npm                | Anthropic-compatible router                              |
 | Open WebUI           | `ghcr.io/open-webui/open-webui:main` | Web chat UI                                   |
 
-### Models downloaded by default
+### Models in `~/.models/`
 
-| Model                                          | Size (Q-quant) | Used as          |
-| ---------------------------------------------- | -------------- | ---------------- |
-| `Qwen2.5-14B-Instruct-Q4_K_M.gguf`             | ~9 GB          | Coding / general |
-| `google_gemma-3-4b-it-Q5_K_M.gguf` + mmproj-f16 | ~3.6 GB        | Family chat + vision |
+| Model file                                          | Size (Q-quant) | Backend | Role |
+| ---------------------------------------------------- | -------------- | ------- | ---- |
+| `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf`              | ~4.4 GB        | GPU     | **Default for Claude Code** (`background` route, fast on P100) |
+| `Qwen2.5-14B-Instruct-Q4_K_M.gguf`                   | ~9 GB          | GPU     | Heavier alternative; slower on P100, kept opt-in              |
+| `google_gemma-3-4b-it-Q5_K_M.gguf` + mmproj-f16      | ~3.6 GB        | GPU     | Family chat in Open WebUI, with vision                        |
+| `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf`            | ~4.4 GB        | CPU     | Reasoning model. Coexists with the active GPU model.          |
+
+The first three live in the `gpu` swap group (only one resident at a time);
+DeepSeek-R1 lives in its own `cpu` group and is independent.
+
+> **Note on the installer.** `my-ia-setup-install.sh` currently only
+> downloads the legacy 14B Instruct + Gemma. The 7B Coder and DeepSeek-R1
+> were added post-install and are documented in
+> [Post-install changes](#post-install-changes) below. A future revision of
+> the installer should subsume that section.
 
 ---
 
@@ -229,26 +269,50 @@ npm install -g @anthropic-ai/claude-code
 claude --version
 ```
 
-### 3. Configure environment variables
+### 3. Configure Claude Code via `settings.json` (preferred)
 
-Open a fresh **CMD** window and run:
+Claude Code reads its environment from `C:\Users\<user>\.claude\settings.json`
+under the `env` key. Putting the configuration there (instead of using
+Windows `setx` shell variables) is more portable, doesn't pollute the
+PowerShell environment, and is easier to revert.
 
-```cmd
-setx ANTHROPIC_BASE_URL "http://<server-ip>:3456"
-setx ANTHROPIC_AUTH_TOKEN "<the CCR_APIKEY printed by the installer>"
-setx ANTHROPIC_API_KEY ""
+Edit (or create) `C:\Users\<user>\.claude\settings.json` so it contains:
+
+```json
+{
+  "permissions": { "defaultMode": "auto" },
+  "model": "claude-haiku-4-5",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://<server-ip>:3456",
+    "ANTHROPIC_AUTH_TOKEN": "<the CCR_APIKEY printed by the installer>",
+    "ANTHROPIC_API_KEY": "",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5"
+  }
+}
 ```
 
-All three are required. The empty `ANTHROPIC_API_KEY` forces Claude Code
-to use the bearer token you set instead of any Anthropic key it might
-otherwise pick up from the environment.
+Why each variable:
+
+| Variable | What it does |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | Sends Claude Code traffic to ccr instead of `api.anthropic.com`. |
+| `ANTHROPIC_AUTH_TOKEN` | Bearer token ccr requires (the `APIKEY` from the server's `~/.claude-code-router/config.json`). |
+| `ANTHROPIC_API_KEY` | Must be empty so CC uses the bearer token, not any leftover Anthropic key. |
+| `CLAUDE_CODE_ATTRIBUTION_HEADER` | Setting it to `"0"` stops CC from injecting the `x-anthropic-billing-header: ...; cch=...` block, whose per-turn rotation would otherwise invalidate the local model's KV cache on every turn. **Without this flag every turn pays a full ~70 s prefill.** |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | Pinned to a haiku id that ccr's `local` provider claims, so subagents without an explicit model run on the local Qwen 7B for free. Subagents that declare their own model are unaffected. |
+
+Save the file. Close every Claude Code window — settings are read at
+startup, not on the fly.
+
+> **Avoid mixing both methods.** If you also have `ANTHROPIC_*` set as
+> Windows shell variables (`setx`), those win over `settings.json`. To keep
+> things simple, remove any `ANTHROPIC_*` from "User variables" in the
+> Windows environment dialog so only `settings.json` defines them.
 
 The token is the `APIKEY` field in the server's
 `~/.claude-code-router/config.json`. Treat it as a secret — anyone with
 that token and the URL can spend Anthropic credits on your account.
-
-**Close every CMD/PowerShell window** after `setx` — the new values are
-only visible in terminals opened *after* the change.
 
 ### 4. First run
 
@@ -261,42 +325,59 @@ Send a trivial prompt to confirm the round trip works.
 
 ### 5. Verify routing in real time
 
-On the server, tail ccr's selection log:
+On the server, tail ccr's per-launch log (rotates on each restart):
 
 ```bash
-tail -F ~/.claude-code-router/logs/ccr-*.log | grep -iE 'selected_provider|model|route'
+LOG=~/.claude-code-router/logs/$(ls -t ~/.claude-code-router/logs/ | head -1)
+tail -F "$LOG" | grep -iE 'selected_provider|model|background|"timings"'
 ```
 
 Expected behaviour for a few common interactions:
 
-| Client action                          | Route fired      | Backend                  | Costs API? |
-| -------------------------------------- | ---------------- | ------------------------ | ---------- |
-| Normal chat / code edits               | `default`        | Sonnet 4.6 (Anthropic)   | yes        |
-| Auto-compaction of conversation        | `background`     | Qwen2.5-14B (local)      | no         |
-| Extended thinking (`think harder`)     | `think`          | Opus 4.7 (Anthropic)     | yes (more) |
-| Single message > `longContextThreshold` | `longContext`    | Opus 4.7 (Anthropic)     | yes        |
+| Client action                          | Route fired      | Backend                       | Costs API? |
+| -------------------------------------- | ---------------- | ----------------------------- | ---------- |
+| Normal chat / code edits               | `default`        | Sonnet 4.6 (Anthropic)        | yes        |
+| Auto-compaction of conversation        | `background`     | Qwen2.5-Coder-7B (local, GPU) | no         |
+| Extended thinking (`think harder`)     | `think`          | Opus 4.7 (Anthropic)          | yes (more) |
+| Single message > `longContextThreshold` | `longContext`    | Opus 4.7 (Anthropic)          | yes        |
+| Subagent without explicit model        | `background`     | Qwen2.5-Coder-7B (local, GPU) | no         |
+
+#### Reading the per-turn timings
+
+Each completed turn writes a `timings` block to the ccr log. The two
+critical numbers are `prompt_n` (tokens in this turn's prompt) and
+`cache_n` (tokens reused from the previous turn's KV cache):
+
+```bash
+grep '"timings"' "$LOG" | tail -1 | python3 -c '
+import sys, json, re
+m = re.search(r"\"timings\":\{[^}]*\}", sys.stdin.read())
+t = json.loads("{"+m.group(0)+"}")["timings"]
+print(f"prompt={t.get(\"prompt_n\")} cached={t.get(\"cache_n\")} prefill={t.get(\"prompt_per_second\",0):.0f}t/s gen={t.get(\"predicted_per_second\",0):.1f}t/s")'
+```
+
+Healthy second turn: `cached ≈ prompt`, `responseTime` 1–3 s. If `cached`
+stays low (~30) across turns, the prompt prefix is rotating — most likely
+`CLAUDE_CODE_ATTRIBUTION_HEADER=0` is missing from the client's
+`settings.json` or the env var is being shadowed by a Windows shell var.
 
 ### 6. Troubleshooting (Windows side)
 
 | Symptom                                  | First check                                                                                  |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `ECONNREFUSED` / connection error        | ccr is down (`systemctl status ccr` on server) or firewall is blocking `:3456`.              |
+| `ECONNREFUSED` / connection error        | ccr is down (`systemctl is-active ccr` on server) or firewall is blocking `:3456`.           |
 | Claude Code returns `401 Unauthorized`   | `ANTHROPIC_AUTH_TOKEN` ≠ `APIKEY` in the server's `config.json`.                             |
-| Asks you to log in / wants billing info  | `ANTHROPIC_API_KEY` was not blanked. Re-run `setx ANTHROPIC_API_KEY ""` then reopen the terminal. |
-| First background call hangs ~10 s        | `llama-swap` is loading the local model on demand. Subsequent calls are instant until TTL.   |
+| Asks you to log in / wants billing info  | `ANTHROPIC_API_KEY` was not blanked in `settings.json`, or a Windows shell var is shadowing it. Remove any user/system `ANTHROPIC_*` shell vars. |
+| First background call hangs ~10 s        | `llama-swap` is loading the local model on demand. Subsequent calls are fast until TTL.      |
+| Every turn takes ~70 s on the local model | `CLAUDE_CODE_ATTRIBUTION_HEADER` is missing or shadowed. Confirm `cache_n` in the ccr log.   |
+| Server-side OOM after a model swap       | Long-running KV cache plus another model loading. `systemctl restart llama-swap` clears it.  |
 
 ### 7. Reverting to direct Anthropic mode
 
 To bypass the router and talk to Anthropic directly (e.g. while debugging
-the server):
-
-```cmd
-setx ANTHROPIC_BASE_URL ""
-setx ANTHROPIC_AUTH_TOKEN ""
-setx ANTHROPIC_API_KEY "sk-ant-your-personal-key"
-```
-
-Re-run the three `setx` commands from step 3 to switch back.
+the server), edit `settings.json` and remove the three `ANTHROPIC_*` keys
+(or set `ANTHROPIC_API_KEY` to your real key and remove the other two).
+Restart Claude Code. To switch back, restore the entries from step 3.
 
 ---
 
@@ -308,17 +389,180 @@ The matrix below is what the installer writes to `config.json`.
 | Route          | Backend                       | When it fires                                  |
 | -------------- | ----------------------------- | ---------------------------------------------- |
 | `default`      | `anthropic,claude-sonnet-4-6` | Normal interactive prompts                     |
-| `background`   | `local,qwen2.5-14b`           | Auto-compactions, summarisation, tool calls    |
+| `background`   | `local,qwen2.5-coder-7b`      | Auto-compactions, summarisation, subagents w/o explicit model |
 | `think`        | `anthropic,claude-opus-4-7`   | Extended-thinking requests                     |
 | `longContext`  | `anthropic,claude-opus-4-7`   | Total tokens > `longContextThreshold` (60000)  |
 
+The `local` provider's `models` list also claims the haiku ids
+(`claude-3-5-haiku-20241022`, `claude-haiku-4-5`,
+`claude-haiku-4-5-20251001`), so any haiku-tagged request from CC (the
+default model selection, the subagent model, etc.) is automatically routed
+to the local Qwen 7B.
+
 ### Cost knobs
 
-- **Make most things free**: change `default` to `local,qwen2.5-14b` and drop
-  `longContextThreshold` to ~30000 (below the local context window). Lower
-  quality, near-zero API spend.
+- **Make most things free**: change `default` to `local,qwen2.5-coder-7b`
+  and drop `longContextThreshold` to ~30000. Lower quality, near-zero API
+  spend. Latency depends entirely on the prefill cost of CC's ~28 K-token
+  system prompt; with `--cache-reuse` and the attribution-header flag set,
+  steady-state is acceptable.
 - **Custom router**: point `CUSTOM_ROUTER_PATH` at a JS module that inspects
   the request and decides per-prompt. Best cost/quality ratio.
+
+### Custom transformers
+
+`~/.claude-code-router/plugins/strip-billing-header.js` is registered as a
+transformer on the `local` provider. It filters any system block whose
+text starts with `x-anthropic-billing-header:` (both Anthropic-shaped
+`system: [...]` and OpenAI-shaped `messages: [{role:"system"}]`). The
+client-side `CLAUDE_CODE_ATTRIBUTION_HEADER=0` flag does the same job from
+the source; the plugin remains as a fallback in case a client forgets the
+flag or runs an older CC version. Add new transformers as JS files in
+`~/.claude-code-router/plugins/` and register them in the `transformers`
+array in `config.json`.
+
+---
+
+## Post-install changes
+
+The installer (`my-ia-setup-install.sh`) currently only ships the legacy
+14B Instruct + Gemma stack and a vanilla `llama-swap` config. The host has
+since been moved to the architecture documented here. If you re-run the
+installer on a fresh machine, you'll need to re-apply these steps to reach
+parity:
+
+### 1. Download additional models
+
+```bash
+cd ~/.models
+
+# Qwen 2.5 Coder 7B — default for Claude Code (GPU)
+curl -L --fail -o Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf \
+  "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf?download=true"
+
+# DeepSeek-R1-Distill-Qwen 7B — reasoning model on CPU
+curl -L --fail -o DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf \
+  "https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf?download=true"
+```
+
+### 2. Update `~/.config/llama-swap/config.yaml`
+
+Register the new models, tune the existing one, and add `groups` so the GPU
+and CPU models are independent. The minimal shape:
+
+```yaml
+healthCheckTimeout: 120
+
+models:
+  qwen2.5-coder-7b:
+    aliases: [qwen-coder, qwen2.5-7b-coder]
+    cmd: |
+      llama-server -m /home/alex/.models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+        --ctx-size 65536
+        --parallel 1
+        --cache-reuse 256
+        --n-gpu-layers 99
+        --jinja
+        --host 127.0.0.1
+        --port ${PORT}
+    ttl: 600
+
+  qwen2.5-14b-coder:
+    aliases: [qwen2.5-14b]
+    cmd: |
+      llama-server -m /home/alex/.models/Qwen2.5-14B-Instruct-Q4_K_M.gguf
+        --ctx-size 65536
+        --parallel 1
+        --cache-reuse 256
+        --n-gpu-layers 99
+        --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on
+        --jinja
+        --host 127.0.0.1
+        --port ${PORT}
+    ttl: 600
+
+  gemma-3-4b-familiar:
+    aliases: [gemma-3-4b]
+    cmd: |
+      llama-server -m /home/alex/.models/google_gemma-3-4b-it-Q5_K_M.gguf
+        --mmproj /home/alex/.models/mmproj-google_gemma-3-4b-it-f16.gguf
+        --ctx-size 8192
+        --n-gpu-layers 99
+        --jinja
+        --host 127.0.0.1
+        --port ${PORT}
+    ttl: 600
+
+  deepseek-r1-distill-7b:
+    aliases: [r1-7b, deepseek-r1-7b]
+    env: ["CUDA_VISIBLE_DEVICES="]
+    cmd: |
+      llama-server -m /home/alex/.models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf
+        --ctx-size 16384
+        --n-gpu-layers 0
+        --threads 12
+        --threads-batch 16
+        --jinja
+        --host 127.0.0.1
+        --port ${PORT}
+    ttl: 600
+
+groups:
+  gpu:
+    swap: true
+    exclusive: false
+    members: [qwen2.5-coder-7b, qwen2.5-14b-coder, gemma-3-4b-familiar]
+  cpu:
+    swap: true
+    exclusive: false
+    members: [deepseek-r1-distill-7b]
+```
+
+Notes:
+
+- The 7B Coder is intentionally configured **without** `--flash-attn` and
+  with `f16` KV cache. On Pascal these flags hurt; on Ampere+ you'd want
+  to enable them.
+- `--cache-reuse 256` only pays off when the prompt prefix is byte-stable;
+  see the client-side `CLAUDE_CODE_ATTRIBUTION_HEADER` flag below.
+- `CUDA_VISIBLE_DEVICES=""` is essential for the CPU model — even with
+  `--n-gpu-layers 0`, a CUDA-built `llama-server` still tries to allocate
+  ~1 GB on GPU 0 and segfaults if the GPU is full.
+
+Then `sudo systemctl restart llama-swap`.
+
+### 3. Update `~/.claude-code-router/config.json`
+
+Three changes:
+
+1. Set `Router.background` to `local,qwen2.5-coder-7b` (was 14B).
+2. Add `qwen2.5-coder-7b` and `deepseek-r1-distill-7b` to the `local`
+   provider's `models` list.
+3. Register the local provider's `transformer.use` to include
+   `strip-billing-header`, and add the plugin path under top-level
+   `transformers`:
+
+```json
+"transformers": [
+  { "path": "/home/alex/.claude-code-router/plugins/strip-billing-header.js" }
+]
+```
+
+4. Drop the plugin file at
+   `~/.claude-code-router/plugins/strip-billing-header.js` (see the file
+   in this repo's `plugins/` directory for the canonical implementation).
+
+5. Set `LOG: true` in the same config to enable per-turn logs in
+   `~/.claude-code-router/logs/`.
+
+Then `sudo systemctl restart ccr`.
+
+### 4. Set Claude Code's `settings.json` on the client
+
+See [§ Client setup — step 3](#3-configure-claude-code-via-settingsjson-preferred).
+Without `CLAUDE_CODE_ATTRIBUTION_HEADER=0` in the client, the local-model
+path will still work but every turn will pay a full ~70 s prefill instead
+of 1–3 s.
 
 ---
 
@@ -419,7 +663,9 @@ The script keeps the last 14 backups and prunes older ones.
 | `/usr/local/bin/llama-server`                 | Symlink into `~/llama.cpp/build/bin/`              |
 | `/usr/local/bin/llama-swap`                   | Pinned binary release                              |
 | `~/.claude-code-router/config.json`           | ccr routing + Anthropic API key (mode 0600)        |
-| `~/.config/llama-swap/config.yaml`            | Per-model cmd + aliases + ttl                      |
+| `~/.claude-code-router/plugins/`              | Custom transformer plugins (e.g. `strip-billing-header.js`) |
+| `~/.claude-code-router/logs/ccr-*.log`        | Per-launch ccr logs (rotates on restart)           |
+| `~/.config/llama-swap/config.yaml`            | Per-model cmd + aliases + ttl + groups             |
 | `~/ai-setup-docs/`                            | Source-of-truth tree mirroring `/etc/systemd/...`  |
 | `~/ai-setup-docs/systemd/`                    | All unit files                                     |
 | `~/ai-setup-docs/scripts/`                    | healthcheck, backup, update-stack                  |
@@ -434,9 +680,11 @@ The script keeps the last 14 backups and prunes older ones.
 
 ```
 my-ia-setup/
-├── my-ia-setup-install.sh   # The installer. ~900 lines, idempotent.
-├── CLAUDE.md                # Working notes for Claude Code agents.
-├── README.md                # This file.
+├── my-ia-setup-install.sh           # The base installer. ~900 lines, idempotent.
+├── plugins/
+│   └── strip-billing-header.js      # ccr transformer (cached fallback for the billing header bug)
+├── CLAUDE.md                        # Working notes for Claude Code agents.
+├── README.md                        # This file.
 └── .gitignore
 ```
 
