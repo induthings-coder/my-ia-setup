@@ -201,6 +201,105 @@ from `~/.claude-code-router/config.json` if you also restored that file.
 
 ---
 
+## Client setup — Windows + Claude Code
+
+Once the server is running, point Claude Code on a Windows client at the
+router. Anything the client does is routed by ccr based on the
+[Routing matrix](#routing) below.
+
+### 1. Verify network reachability
+
+In PowerShell:
+
+```powershell
+Test-NetConnection <server-ip> -Port 3456
+```
+
+Expect `TcpTestSucceeded : True`. If it fails, the server's firewall is
+blocking inbound on `:3456` (ccr binds `0.0.0.0`, so only the firewall
+should be in the way).
+
+### 2. Install Claude Code
+
+Install Node.js 20.x LTS from <https://nodejs.org/>, then in CMD or
+PowerShell (regular user, not admin):
+
+```cmd
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
+
+### 3. Configure environment variables
+
+Open a fresh **CMD** window and run:
+
+```cmd
+setx ANTHROPIC_BASE_URL "http://<server-ip>:3456"
+setx ANTHROPIC_AUTH_TOKEN "<the CCR_APIKEY printed by the installer>"
+setx ANTHROPIC_API_KEY ""
+```
+
+All three are required. The empty `ANTHROPIC_API_KEY` forces Claude Code
+to use the bearer token you set instead of any Anthropic key it might
+otherwise pick up from the environment.
+
+The token is the `APIKEY` field in the server's
+`~/.claude-code-router/config.json`. Treat it as a secret — anyone with
+that token and the URL can spend Anthropic credits on your account.
+
+**Close every CMD/PowerShell window** after `setx` — the new values are
+only visible in terminals opened *after* the change.
+
+### 4. First run
+
+```cmd
+cd C:\path\to\some\project
+claude
+```
+
+Send a trivial prompt to confirm the round trip works.
+
+### 5. Verify routing in real time
+
+On the server, tail ccr's selection log:
+
+```bash
+tail -F ~/.claude-code-router/logs/ccr-*.log | grep -iE 'selected_provider|model|route'
+```
+
+Expected behaviour for a few common interactions:
+
+| Client action                          | Route fired      | Backend                  | Costs API? |
+| -------------------------------------- | ---------------- | ------------------------ | ---------- |
+| Normal chat / code edits               | `default`        | Sonnet 4.6 (Anthropic)   | yes        |
+| Auto-compaction of conversation        | `background`     | Qwen2.5-14B (local)      | no         |
+| Extended thinking (`think harder`)     | `think`          | Opus 4.7 (Anthropic)     | yes (more) |
+| Single message > `longContextThreshold` | `longContext`    | Opus 4.7 (Anthropic)     | yes        |
+
+### 6. Troubleshooting (Windows side)
+
+| Symptom                                  | First check                                                                                  |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `ECONNREFUSED` / connection error        | ccr is down (`systemctl status ccr` on server) or firewall is blocking `:3456`.              |
+| Claude Code returns `401 Unauthorized`   | `ANTHROPIC_AUTH_TOKEN` ≠ `APIKEY` in the server's `config.json`.                             |
+| Asks you to log in / wants billing info  | `ANTHROPIC_API_KEY` was not blanked. Re-run `setx ANTHROPIC_API_KEY ""` then reopen the terminal. |
+| First background call hangs ~10 s        | `llama-swap` is loading the local model on demand. Subsequent calls are instant until TTL.   |
+
+### 7. Reverting to direct Anthropic mode
+
+To bypass the router and talk to Anthropic directly (e.g. while debugging
+the server):
+
+```cmd
+setx ANTHROPIC_BASE_URL ""
+setx ANTHROPIC_AUTH_TOKEN ""
+setx ANTHROPIC_API_KEY "sk-ant-your-personal-key"
+```
+
+Re-run the three `setx` commands from step 3 to switch back.
+
+---
+
 ## Routing
 
 `claude-code-router` chooses a backend per request based on its category.
