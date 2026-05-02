@@ -1,0 +1,19 @@
+# Local Claude Code state — user-specific permissions, not portable
+.claude/settings.local.json
+
+# Common editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Anything resembling a secret (defence in depth — should not exist anyway)
+*.env
+.env*
+secrets/
+*.key
+*.pem
+
+# Backups generated locally
+backups/
+*.bak
+*.bak.*
