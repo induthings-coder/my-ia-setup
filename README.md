@@ -103,8 +103,11 @@ Tested and verified on:
 | --------- | ------------------------------------- |
 | CPU       | Intel Xeon E5-2695 v4 (18C/36T)       |
 | RAM       | 48 GB DDR4                            |
-| GPU       | NVIDIA Tesla P100 16 GB (Pascal, CC 6.0) |
+| GPU 0 (compute) | NVIDIA Tesla P100 16 GB (Pascal, CC 6.0) — driven by the proprietary `nvidia` 535 driver, dedicated to CUDA |
+| GPU 1 (display, optional) | NVIDIA GeForce GT 730 (Kepler GK208B) — driven by `nouveau`, used only for the local desktop (Kepler is unsupported by 535 and is intentionally ignored by it) |
 | Storage   | ~50 GB free for models + builds       |
+
+The Tesla P100 is the only GPU CUDA ever sees. The GT 730 is purely a video output card for the local desktop, kept on `nouveau`. See [GPU layout & nvidia-persistenced](#gpu-layout--nvidia-persistenced) for why the split matters.
 
 The installer enforces the following minimums (override via env vars):
 
@@ -557,6 +560,32 @@ Three changes:
 
 Then `sudo systemctl restart ccr`.
 
+### 3a. Install the systemd drop-ins for the persistence daemon
+
+Required on any host that uses the `nvidia-driver-535` package (Ubuntu 24.04 default), even if there's only one GPU. See [GPU layout & nvidia-persistenced](#gpu-layout--nvidia-persistenced) for the full reasoning.
+
+```bash
+sudo install -d /etc/systemd/system/nvidia-persistenced.service.d
+sudo tee /etc/systemd/system/nvidia-persistenced.service.d/override.conf >/dev/null <<'EOF'
+[Unit]
+StopWhenUnneeded=false
+
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nvidia-persistenced --user nvidia-persistenced --verbose
+EOF
+
+sudo install -d /etc/systemd/system/llama-swap.service.d
+sudo tee /etc/systemd/system/llama-swap.service.d/nvidia-persistenced.conf >/dev/null <<'EOF'
+[Unit]
+Wants=nvidia-persistenced.service
+After=nvidia-persistenced.service
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart llama-swap
+```
+
 ### 4. Set Claude Code's `settings.json` on the client
 
 See [§ Client setup — step 3](#3-configure-claude-code-via-settingsjson-preferred).
@@ -594,6 +623,78 @@ models:
 ```
 
 Then `sudo systemctl restart llama-swap.service`.
+
+---
+
+## GPU layout & nvidia-persistenced
+
+The host has two NVIDIA GPUs at different PCI addresses, each on a different driver. The split is intentional and load-bearing:
+
+| PCI bus | GPU | Driver | Used by |
+| --- | --- | --- | --- |
+| `03:00.0` | Tesla P100 16 GB | `nvidia` 535.x (proprietary) | CUDA → `llama-server` |
+| `04:00.0` | GeForce GT 730 | `nouveau` | local desktop (gdm/Xorg) |
+
+The 535 driver explicitly refuses Kepler (`NVRM: ... will ignore this GPU`), which is the desired outcome — `nouveau` drives the GT 730 for the desktop, and `nvidia` only ever talks to the P100. `prime-select` is set to `on-demand`. **Avoid switching to `prime-select nvidia` or installing the 470 legacy driver** to "support" the GT 730 — both break CUDA on the P100, and inference silently falls back to CPU (~7 t/s instead of ~40 t/s) without any error in `nvidia-smi`.
+
+### The persistence daemon is required
+
+Ubuntu's `nvidia-persistenced.service` (shipped by `nvidia-driver-535`) is configured for a laptop Optimus profile, not a server:
+
+- `StopWhenUnneeded=true` → systemd kills the daemon ~1 s after start unless something `Wants=` it
+- `--no-persistence-mode` → even if it stays up, it does nothing
+
+Without a running persistence daemon, the kernel module unloads whenever no process holds a handle, and the next `cuInit()` from `llama-server` races against the unload and fails with `unknown error` (CUDA error 999). Two systemd drop-ins fix this and are part of the deployed configuration:
+
+```ini
+# /etc/systemd/system/nvidia-persistenced.service.d/override.conf
+[Unit]
+StopWhenUnneeded=false
+
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nvidia-persistenced --user nvidia-persistenced --verbose
+```
+
+```ini
+# /etc/systemd/system/llama-swap.service.d/nvidia-persistenced.conf
+[Unit]
+Wants=nvidia-persistenced.service
+After=nvidia-persistenced.service
+```
+
+After dropping these files in:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart llama-swap
+```
+
+`llama-swap` now pulls `nvidia-persistenced` up on start, the daemon keeps four handles open on `/dev/nvidia0`, and `cuInit()` succeeds reliably. To verify:
+
+```bash
+systemctl is-active nvidia-persistenced llama-swap ccr
+nvidia-smi --query-gpu=persistence_mode,memory.used --format=csv,noheader
+# After a request that loads qwen2.5-coder-7b: Enabled, ~8598 MiB
+```
+
+### Module parameter hygiene
+
+Files in `/etc/modprobe.d/` only need three NVIDIA-related entries:
+
+| File | Purpose |
+| --- | --- |
+| `nvidia-graphics-drivers-kms.conf` | shipped by `nvidia-driver-535`; sets `nvidia-drm modeset=0` |
+| `gt730-fix.conf` | local; sets `nouveau modeset=1` so the GT 730 drives the desktop |
+| `blacklist-framebuffer.conf` | Ubuntu default; do not touch |
+
+Anything else (typically `NVreg_*` knobs added during troubleshooting) is suspect — the 535 driver silently ignores any parameter it doesn't recognise. To check for leftover noise:
+
+```bash
+sudo dmesg | grep -i 'unknown parameter'
+```
+
+A clean boot should show no NVRM `unknown parameter` lines.
 
 ---
 
@@ -741,6 +842,9 @@ To switch to a different GPU generation, set `CUDA_ARCH` (and update
 | Out-of-memory on model load                       | Drop `--ctx-size`, or reduce `--n-gpu-layers` to offload some layers to CPU. |
 | Healthcheck always reports DEGRADED               | Run `~/ai-setup-docs/scripts/healthcheck.sh` directly to see which probe fails. |
 | Install loops on the same step                    | Re-run with `bash -x ./my-ia-setup-install.sh` to see what each `ensure_*` decides. |
+| Local model answers but is suddenly slow (~7 t/s instead of ~40), `nvidia-smi` shows GPU at `0 MiB / 0 %` while inference runs | `nvidia-persistenced` is dead. CUDA fell back to CPU silently. Check `systemctl is-active nvidia-persistenced` and `nvidia-smi --query-gpu=persistence_mode --format=csv`. See [GPU layout & nvidia-persistenced](#gpu-layout--nvidia-persistenced). |
+| `dmesg` shows a tight `nvidia-modeset: Unloading / Loading` loop while CUDA is starting | Same root cause: persistence daemon stopped, module is unloading between `cuInit()` calls. The drop-ins in the persistence section fix it. |
+| `dmesg | grep 'unknown parameter'` shows `NVreg_*` lines | Stale `/etc/modprobe.d/` files with parameters from a different driver version. Safe to remove (back them up to `/var/backups/` first). |
 
 ---
 
