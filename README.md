@@ -279,19 +279,40 @@ under the `env` key. Putting the configuration there (instead of using
 Windows `setx` shell variables) is more portable, doesn't pollute the
 PowerShell environment, and is easier to revert.
 
+The goal of this file is a **balanced split** between Anthropic and the local
+model: Sonnet 4.6 for the main conversation (precision when it matters), Opus
+4.7 only when explicitly requested via `/think` or auto-promoted by long
+context, and Qwen 7B local (free) for everything cheap — haiku-tier internal
+calls and subagents. ccr already enforces that routing on the server side; the
+`settings.json` below just rides it without contradicting it.
+
 Edit (or create) `C:\Users\<user>\.claude\settings.json` so it contains:
 
 ```json
 {
-  "permissions": { "defaultMode": "auto" },
-  "model": "claude-haiku-4-5",
   "env": {
     "ANTHROPIC_BASE_URL": "http://<server-ip>:3456",
     "ANTHROPIC_AUTH_TOKEN": "<the CCR_APIKEY printed by the installer>",
     "ANTHROPIC_API_KEY": "",
+
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5",
+
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5"
-  }
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
+    "DISABLE_COST_WARNINGS": "1",
+    "DISABLE_MICROCOMPACT": "1",
+    "CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING": "1",
+
+    "API_TIMEOUT_MS": "600000",
+    "BASH_DEFAULT_TIMEOUT_MS": "120000"
+  },
+  "permissions": { "defaultMode": "auto" },
+  "autoUpdatesChannel": "latest",
+  "theme": "dark",
+  "skipAutoPermissionPrompt": true
 }
 ```
 
@@ -302,16 +323,36 @@ Why each variable:
 | `ANTHROPIC_BASE_URL` | Sends Claude Code traffic to ccr instead of `api.anthropic.com`. |
 | `ANTHROPIC_AUTH_TOKEN` | Bearer token ccr requires (the `APIKEY` from the server's `~/.claude-code-router/config.json`). |
 | `ANTHROPIC_API_KEY` | Must be empty so CC uses the bearer token, not any leftover Anthropic key. |
+| `ANTHROPIC_SMALL_FAST_MODEL` | The "small/fast" model CC uses for title generation, prompt expansion, summarization. Pinned to `claude-haiku-4-5`, which ccr's `local` provider claims and routes to Qwen 7B locally — those calls are free. (`ANTHROPIC_DEFAULT_HAIKU_MODEL` is **not** a Claude Code variable, despite some forum posts using that name; setting it is a silent no-op.) |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | Pinned to the same haiku id, so subagents without an explicit model run on Qwen 7B for free. Subagents that declare their own model are unaffected. |
 | `CLAUDE_CODE_ATTRIBUTION_HEADER` | Setting it to `"0"` stops CC from injecting the `x-anthropic-billing-header: ...; cch=...` block, whose per-turn rotation would otherwise invalidate the local model's KV cache on every turn. **Without this flag every turn pays a full ~70 s prefill.** |
-| `CLAUDE_CODE_SUBAGENT_MODEL` | Pinned to a haiku id that ccr's `local` provider claims, so subagents without an explicit model run on the local Qwen 7B for free. Subagents that declare their own model are unaffected. |
+| `CLAUDE_CODE_ENABLE_TELEMETRY` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` / `DISABLE_NON_ESSENTIAL_MODEL_CALLS` | Disable telemetry and incidental model calls (UI heuristics, suggestion expansions). Reduces Anthropic spend without affecting core behaviour. |
+| `DISABLE_MICROCOMPACT` | Skips automatic micro-compaction during the turn. Slightly less polished context handling, but every compaction turn is a free Anthropic call you avoid. |
+| `CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING` | Drops fine-grained tool input streaming (a small UX downgrade, no functional impact) and saves a few small calls per tool invocation. |
+| `DISABLE_COST_WARNINGS` | Quality-of-life only; suppresses the in-CLI cost dialog. |
+| `API_TIMEOUT_MS` | 600 000 ms / 10 min. Long Opus + thinking + tool-use turns can exceed 120 s; matching the server's `API_TIMEOUT_MS` (in `~/.claude-code-router/config.json`) prevents intermittent client timeouts on the very requests it's most valuable to let finish. |
+| `BASH_DEFAULT_TIMEOUT_MS` | Per-bash-call timeout, separate from the API timeout. 120 s suits typical commands; raise per-call with explicit timeouts when running builds. |
 
 Save the file. Close every Claude Code window — settings are read at
 startup, not on the fly.
 
-> **Avoid mixing both methods.** If you also have `ANTHROPIC_*` set as
-> Windows shell variables (`setx`), those win over `settings.json`. To keep
-> things simple, remove any `ANTHROPIC_*` from "User variables" in the
-> Windows environment dialog so only `settings.json` defines them.
+**Anti-patterns to avoid in this file** (each looks like an optimisation but
+breaks the intended balance):
+
+- **`"model": "claude-haiku-4-5"` at the top level.** `claude-haiku-4-5` is one
+  of the model IDs ccr's `local` provider claims, so a top-level pin sends
+  *every* conversation turn — refactors, debugging, architecture — through
+  Qwen 7B locally. That destroys the Sonnet/Opus precision the rest of the
+  config is built to preserve. Only set `model` if you genuinely want all
+  turns local.
+- **`"DISABLE_PROMPT_CACHING": "1"`.** Looks like it saves money; in fact it
+  removes Anthropic's ~90 % prefix-cache discount on the repeated system
+  prompt, so every Sonnet/Opus turn after the first pays full input cost.
+  Multiplies Anthropic spend by roughly 10×. Leave prompt caching on.
+- **Any `ANTHROPIC_*` set in Windows "User variables" via `setx`.** Shell vars
+  win over `settings.json` — easy to chase ghost behaviour. Remove every
+  `ANTHROPIC_*` from the Windows environment dialog and let `settings.json`
+  be the single source of truth.
 
 The token is the `APIKEY` field in the server's
 `~/.claude-code-router/config.json`. Treat it as a secret — anyone with

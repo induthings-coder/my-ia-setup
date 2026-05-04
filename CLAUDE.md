@@ -93,21 +93,42 @@ Symptoms that this is broken: `nvidia-smi` looks fine, `qwen2.5-coder-7b` answer
 
 ## Client setup (Windows + Claude Code)
 
-The Windows client should put **all** AI configuration in `C:\Users\<user>\.claude\settings.json` under `env` (not as Windows shell variables — CC reads from settings.json, and the shell takes precedence only if both are set, which is confusing):
+The Windows client should put **all** AI configuration in `C:\Users\<user>\.claude\settings.json` under `env` (not as Windows shell variables — CC reads from settings.json, and the shell takes precedence only if both are set, which is confusing). The intended balance is **Sonnet 4.6 for the main conversation, Qwen 7B for everything cheap (haiku tier, subagents, summarization), Opus 4.7 only when explicitly requested via `/think` or auto-promoted by `longContext`**. ccr already enforces that routing — the client config just rides it:
 
 ```json
 {
   "env": {
-    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5",
     "ANTHROPIC_BASE_URL": "http://192.168.1.199:3456",
     "ANTHROPIC_AUTH_TOKEN": "<router APIKEY from config.json>",
-    "ANTHROPIC_API_KEY": ""
-  }
+    "ANTHROPIC_API_KEY": "",
+
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku-4-5",
+
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
+    "DISABLE_COST_WARNINGS": "1",
+    "DISABLE_MICROCOMPACT": "1",
+    "CLAUDE_CODE_DISABLE_FINE_GRAINED_TOOL_STREAMING": "1",
+
+    "API_TIMEOUT_MS": "600000",
+    "BASH_DEFAULT_TIMEOUT_MS": "120000"
+  },
+  "permissions": { "defaultMode": "auto" },
+  "skipAutoPermissionPrompt": true
 }
 ```
 
-`CLAUDE_CODE_SUBAGENT_MODEL` is set to a haiku model id that ccr's `local` provider claims, so subagents without an explicit model run on the local Qwen 7B for free. Subagents with their own model declaration are unaffected.
+Both `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` point at `claude-haiku-4-5`, which the ccr `local` provider claims and routes to Qwen 7B locally — so haiku-tier internal calls (title generation, prompt expansion, summarization) and subagents without an explicit model are free. Anthropic-issued IDs (`claude-haiku-4-5`) are preferred over passing the raw local model id (`qwen2.5-coder-7b`) so the same `settings.json` keeps working if ccr is bypassed or replaced.
+
+**Pitfalls to actively avoid in this file:**
+
+- A top-level `"model": "claude-haiku-4-5"` (or any haiku-tier id) sends every conversation turn through the local Qwen 7B because of the same provider claim. That destroys the Sonnet/Opus balance — only set `model` if you truly want all turns local.
+- `"DISABLE_PROMPT_CACHING": "1"` looks like a cost-saver but is the opposite: it removes Anthropic's ~90% prefix-cache discount, so every Sonnet/Opus turn pays full input cost. Leave prompt caching enabled.
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL` is **not** a Claude Code variable — `ANTHROPIC_SMALL_FAST_MODEL` is the real name. Setting the wrong one is a silent no-op.
+- An `API_TIMEOUT_MS` ≤ 120 s will time out long Opus + thinking + tool-use turns, which are the ones it is most worth waiting for. Match the server-side `API_TIMEOUT_MS` in `~/.claude-code-router/config.json` (600 s).
 
 ## Editing rules specific to this doc
 
