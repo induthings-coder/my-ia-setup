@@ -868,6 +868,7 @@ my-ia-setup/
 ├── plugins/
 │   └── strip-billing-header.js      # ccr transformer (cached fallback for the billing header bug)
 ├── CLAUDE.md                        # Working notes for Claude Code agents.
+├── INVENTORY.md                     # Snapshot of the live host (hardware, drivers, Xorg, units, ports).
 ├── README.md                        # This file.
 └── .gitignore
 ```
@@ -875,6 +876,12 @@ my-ia-setup/
 The installer is intentionally a single self-contained file; it generates
 the entire `~/ai-setup-docs/` tree on the target host so the deployed copy
 is the source of truth at runtime.
+
+`INVENTORY.md` is a snapshot of the deployed state (kernel cmdline, modprobe
+files, udev rules, Xorg snippets, systemd unit drop-ins, listening ports,
+`~/.models/` contents). Refresh it when the host materially changes — it is
+the disaster-recovery reference, complementing the configuration *intent*
+documented in this README and `CLAUDE.md`.
 
 ---
 
