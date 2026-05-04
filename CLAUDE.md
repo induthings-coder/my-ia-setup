@@ -33,7 +33,13 @@ Three services run on the host, each with a fixed role. Get these relationships 
 | `gemma-3-4b-familiar` | `google_gemma-3-4b-it-Q5_K_M.gguf` + mmproj-f16 | GPU | Family chat in Open WebUI, with vision (mmproj). |
 | `deepseek-r1-distill-7b` | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | CPU | Reasoning model for non-urgent tasks. Coexists with the GPU model. |
 
-The GPU group (`qwen2.5-coder-7b`, `qwen2.5-14b-coder`, `gemma-3-4b-familiar`) shares one slot. Loading any one unloads the others. `deepseek-r1-distill-7b` is in a separate `cpu` group and is independent.
+Three groups instead of one big swap-on-everything group:
+
+- `gpu` — `qwen2.5-coder-7b` + `gemma-3-4b-familiar`, `swap: false`. Both coexist permanently on the P100 (~13.5 GB combined, ~2.5 GB headroom). `ttl: 0` and a `hooks.on_startup.preload` list keep them resident from boot.
+- `gpu-heavy` — `qwen2.5-14b-coder`, `exclusive: true`. Opt-in only. Requesting it unloads the gpu pair (because the gpu group is non-persistent). After `ttl: 600` the 14B unloads, but the gpu pair does **not** auto-reload — it comes back on the next request. To force the preload state again, `sudo systemctl restart llama-swap`.
+- `cpu` — `deepseek-r1-distill-7b`, `persistent: true`. Always resident in RAM. Survives the gpu-heavy eviction because of `persistent: true`. Also preloaded at startup.
+
+Caveat: while the 14B is resident, requesting a non-exclusive group's member (e.g. the 7B) does **not** evict the 14B. The request OOMs and returns 502. This is `llama-swap`'s legacy-groups semantics — only `exclusive: true` triggers cross-group unloads.
 
 ### Why the P100 needs special handling
 

@@ -450,8 +450,8 @@ curl -L --fail -o DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf \
 
 ### 2. Update `~/.config/llama-swap/config.yaml`
 
-Register the new models, tune the existing one, and add `groups` so the GPU
-and CPU models are independent. The minimal shape:
+Three things to get right at once: which models are always loaded, which one
+is opt-in and evicts the rest, and which one runs on CPU. The shape:
 
 ```yaml
 healthCheckTimeout: 120
@@ -468,7 +468,7 @@ models:
         --jinja
         --host 127.0.0.1
         --port ${PORT}
-    ttl: 600
+    ttl: 0   # always loaded; preloaded at startup
 
   qwen2.5-14b-coder:
     aliases: [qwen2.5-14b]
@@ -482,7 +482,7 @@ models:
         --jinja
         --host 127.0.0.1
         --port ${PORT}
-    ttl: 600
+    ttl: 600   # opt-in; unload after 10 min idle
 
   gemma-3-4b-familiar:
     aliases: [gemma-3-4b]
@@ -494,7 +494,7 @@ models:
         --jinja
         --host 127.0.0.1
         --port ${PORT}
-    ttl: 600
+    ttl: 0   # always loaded; preloaded at startup
 
   deepseek-r1-distill-7b:
     aliases: [r1-7b, deepseek-r1-7b]
@@ -508,17 +508,41 @@ models:
         --jinja
         --host 127.0.0.1
         --port ${PORT}
-    ttl: 600
+    ttl: 0   # always loaded; preloaded at startup
 
 groups:
+  # Always-on GPU pair. swap=false → both stay resident together.
+  # Combined VRAM on the P100: ~13.5 GB (8.6 + ~4.9), ~2.5 GB headroom.
+  # Non-persistent so the heavy group can evict on demand.
   gpu:
-    swap: true
+    swap: false
     exclusive: false
-    members: [qwen2.5-coder-7b, qwen2.5-14b-coder, gemma-3-4b-familiar]
+    members: [qwen2.5-coder-7b, gemma-3-4b-familiar]
+
+  # Opt-in heavy GPU model. exclusive=true → evicts non-persistent groups
+  # (the gpu pair). The cpu group is persistent and survives.
+  gpu-heavy:
+    swap: true
+    exclusive: true
+    members: [qwen2.5-14b-coder]
+
+  # CPU-only group, always resident. persistent=true protects it from
+  # being unloaded when gpu-heavy is requested.
   cpu:
-    swap: true
+    swap: false
     exclusive: false
+    persistent: true
     members: [deepseek-r1-distill-7b]
+
+# Preload at startup so the first request after reboot is warm.
+# Members of the gpu group must coexist (swap=false) for multi-preload to
+# work; otherwise llama-swap would just swap them in and out during boot.
+hooks:
+  on_startup:
+    preload:
+      - qwen2.5-coder-7b
+      - gemma-3-4b-familiar
+      - deepseek-r1-distill-7b
 ```
 
 Notes:
@@ -531,8 +555,16 @@ Notes:
 - `CUDA_VISIBLE_DEVICES=""` is essential for the CPU model — even with
   `--n-gpu-layers 0`, a CUDA-built `llama-server` still tries to allocate
   ~1 GB on GPU 0 and segfaults if the GPU is full.
+- After `qwen2.5-14b-coder` is requested, the gpu pair stays unloaded
+  until the 14B's TTL expires (10 min idle) and the next request triggers
+  reload. There is no automatic "go back to preload state" — restart
+  `llama-swap` to force it. Requesting a member of the (non-exclusive)
+  gpu group while the 14B is resident does **not** evict the 14B; the
+  request will OOM and 502 because only `exclusive: true` triggers
+  cross-group unloads.
 
-Then `sudo systemctl restart llama-swap`.
+Then `sudo systemctl restart llama-swap`. After ~25 s the three preloaded
+models should all show as `ready` in `curl -sS http://localhost:8001/running`.
 
 ### 3. Update `~/.claude-code-router/config.json`
 
