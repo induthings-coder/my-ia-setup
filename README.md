@@ -696,6 +696,46 @@ sudo dmesg | grep -i 'unknown parameter'
 
 A clean boot should show no NVRM `unknown parameter` lines.
 
+### Local desktop on the GT 730 (Xorg pin)
+
+Xorg auto-config orders devices by PCI bus, so the P100 (`03:00.0`) is picked first. With `nvidia-drm modeset=0` (set by Ubuntu's `nvidia-graphics-drivers-kms.conf`) the P100 has no KMS, so Xorg dies with `(EE) [drm] Failed to open DRM device for (null): -2` / `no screens found` and gdm loops on `GdmDisplay: Session never registered, failing`. Two pieces are needed:
+
+1. **`gdm` user must be in the `video` and `render` groups** so Xorg launched by gdm can open `/dev/fb0`, `/dev/dri/card0`, and `/dev/dri/renderD128` (all `root:video` / `root:render`):
+
+   ```bash
+   sudo usermod -aG video,render gdm
+   ```
+
+2. **Pin Xorg to the GT 730** with a `modesetting` (KMS) device so it ignores the P100. Drop in `/etc/X11/xorg.conf.d/10-gt730-only.conf`:
+
+   ```
+   Section "Device"
+       Identifier "GT730"
+       Driver     "modesetting"
+       BusID      "PCI:4:0:0"
+       Option     "kmsdev" "/dev/dri/card0"
+   EndSection
+
+   Section "Screen"
+       Identifier "Screen0"
+       Device     "GT730"
+   EndSection
+
+   Section "ServerLayout"
+       Identifier "Layout0"
+       Screen 0  "Screen0"
+   EndSection
+   ```
+
+   Use `Driver "modesetting"`, **not** the legacy UMS `nouveau` Xorg driver — the latter fails with `xf86EnableIO: failed to enable I/O ports 0000-03ff (Operation not permitted)` under the unprivileged Xorg wrapper. If `/usr/share/X11/xorg.conf.d/20-gt730.conf` exists from a previous attempt with `Driver "nouveau"` and no `Screen` section, rename it to `.disabled` — it will conflict.
+
+After both: `sudo systemctl restart gdm` and the greeter should appear on the monitor connected to the GT 730. Verify with:
+
+```bash
+ps -eo user,comm | grep -E 'Xorg|gnome-shell'   # expect Xorg + gnome-shell under user gdm
+loginctl list-sessions                          # expect a seat0/tty1 session for user gdm
+```
+
 ---
 
 ## Operations
