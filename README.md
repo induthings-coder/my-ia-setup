@@ -738,7 +738,7 @@ Xorg auto-config orders devices by PCI bus, so the P100 (`03:00.0`) is picked fi
    sudo usermod -aG video,render gdm
    ```
 
-2. **Pin Xorg to the GT 730** with a `modesetting` (KMS) device so it ignores the P100. Drop in `/etc/X11/xorg.conf.d/10-gt730-only.conf`:
+2. **Pin Xorg to the GT 730** with a `modesetting` (KMS) device so it ignores the P100, and **force a non-SCDC HDMI mode** (1920x1080@60Hz) so it stays within HDMI 1.4 limits — the GT 730 is Kepler GK208B with HDMI 1.4 only (max ~340 MHz pixel clock). With a 4K display attached, the EDID's preferred mode is 3840x2160@60Hz at 533 MHz, which requires HDMI 2.0 / SCDC; nouveau tries it, the SCDC handshake fails (`Failure to read SCDC_TMDS_CONFIG: -6`, kmsOutp `ret:-22`), and the screen stays black even though Xorg/gdm consider the modeset successful. Drop in `/etc/X11/xorg.conf.d/10-gt730-only.conf`:
 
    ```
    Section "Device"
@@ -748,9 +748,20 @@ Xorg auto-config orders devices by PCI bus, so the P100 (`03:00.0`) is picked fi
        Option     "kmsdev" "/dev/dri/card0"
    EndSection
 
+   Section "Monitor"
+       Identifier "HDMI-1"
+       Option     "PreferredMode" "1920x1080"
+   EndSection
+
    Section "Screen"
        Identifier "Screen0"
        Device     "GT730"
+       Monitor    "HDMI-1"
+       DefaultDepth 24
+       SubSection "Display"
+           Depth 24
+           Modes "1920x1080"
+       EndSubSection
    EndSection
 
    Section "ServerLayout"
@@ -759,7 +770,7 @@ Xorg auto-config orders devices by PCI bus, so the P100 (`03:00.0`) is picked fi
    EndSection
    ```
 
-   Use `Driver "modesetting"`, **not** the legacy UMS `nouveau` Xorg driver — the latter fails with `xf86EnableIO: failed to enable I/O ports 0000-03ff (Operation not permitted)` under the unprivileged Xorg wrapper. If `/usr/share/X11/xorg.conf.d/20-gt730.conf` exists from a previous attempt with `Driver "nouveau"` and no `Screen` section, rename it to `.disabled` — it will conflict.
+   Use `Driver "modesetting"`, **not** the legacy UMS `nouveau` Xorg driver — the latter fails with `xf86EnableIO: failed to enable I/O ports 0000-03ff (Operation not permitted)` under the unprivileged Xorg wrapper. If `/usr/share/X11/xorg.conf.d/20-gt730.conf` exists from a previous attempt with `Driver "nouveau"` and no `Screen` section, rename it to `.disabled` — it will conflict. If you swap in a 1080p monitor (or a 4K one over DVI/VGA, both bandwidth-capped on this card), the Monitor + Modes lines are still safe; raise the cap only if you replace the GT 730 with an HDMI 2.0 card.
 
 After both: `sudo systemctl restart gdm` and the greeter should appear on the monitor connected to the GT 730. Verify with:
 
