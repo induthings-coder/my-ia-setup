@@ -1,5 +1,7 @@
 # my-ia-setup
 
+> **Trial in progress:** the host currently runs Qwen3.8-Flash-Next on Strata instead of the llama-swap layout described here. See "Current layout" in `CLAUDE.md`, and use `ai-mode classic` to return to this layout.
+
 A reproducible bare-metal install of a **hybrid AI server**: local
 [`llama.cpp`](https://github.com/ggml-org/llama.cpp) models on a single
 NVIDIA GPU, plus the Anthropic API, routed transparently behind a single

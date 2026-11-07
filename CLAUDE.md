@@ -4,12 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-This repo holds the deployment documentation (not code) for a hybrid AI server: an Ubuntu 24.04 host (192.168.1.199, Xeon E5-2695 v4 / 48GB RAM / NVIDIA P100 16GB) that combines local GGUF models with the Anthropic API, exposed to two client surfaces:
+This repo holds the deployment documentation (not code) for a hybrid AI server: an Ubuntu 24.04 host (192.168.1.199, Xeon E5-2695 v4 / 64GB RAM / NVIDIA P100 16GB, kernel 7.0) that combines local GGUF models with the Anthropic API, exposed to two client surfaces:
 
 1. Claude Code on Windows → `ccr` (port 3456) → routed per-category to Anthropic or to a local model.
 2. Open WebUI in the browser (port 3000) → `llama-swap` (port 8001) → local model.
 
 Edits here are documentation changes. There is no build, lint, or test pipeline. Verify changes by re-reading `README.md` and confirming that commands, ports, paths, and config snippets are internally consistent.
+
+## Current layout: Strata trial (since 2026-11-07)
+
+The host is on a trial where one model replaces Gemma, DeepSeek and Qwen 2.5 for local work. The rest of this file still describes the **classic** layout, which remains installed. Switch with `ai-mode strata|classic|status` (`scripts/ai-mode.sh`, linked from `/usr/local/bin/ai-mode`).
+
+- **`strata.service`** starts the Docker container `strata` (image `strata:poc-sm60-vision`): Qwen3.8-Flash-Next IQ3_XXS, `PARALLEL=2`, 64K context, CPU vision reader. Published on `127.0.0.1:8080` and `172.17.0.1:8080`, never on the LAN. The API key is in `~/strata-poc/strata.env`.
+- **The unit replaces llama-swap as the thing that pulls in `nvidia-persistenced`.** Without `Wants=nvidia-persistenced.service`, disabling llama-swap would break CUDA on the next boot. `strata.service` and `llama-swap.service` declare `Conflicts=` because each needs the whole P100.
+- **Image build:** Strata v0.2.11 from source, `CUDA_ARCHITECTURES=60`, CUDA 12.9.1, `BUILD_VISION=1`, plus the unmerged upstream PR #4274 (`"+&r"` in `include/strata/kernels/dp4a.hpp`). The published `cuda12` images are not known to work on Pascal. Build tree: `~/strata-poc/src`.
+- **ccr** keeps `config.json.strata` and `config.json.classic`. In Strata mode the `local` provider, including the haiku-tier ids, points at Strata.
+- **Open WebUI** reaches Strata at `http://172.17.0.1:8080/v1`. Inside its container `localhost:8080` is Open WebUI itself, so a 200 there proves nothing.
+
+### Measured results (2026-11-07, one run per case, `~/strata-poc/bench`)
+
+| | Qwen3.8 + Strata | Sonnet 4.6 | Qwen 2.5 7B |
+| --- | --- | --- | --- |
+| Easy task, hidden tests | 7/7 in 577 s | 7/7 in 57 s | 0/7, no tool calls |
+| Hard task, hidden tests | 21/22 in 982 s | 21/22 in 456 s | 5/22, no tool calls |
+
+With a chat every 45 s during an agent run, chat first-token latency is 18 s median and 97 s worst at `PARALLEL=1`, and 2 s and 17 s at `PARALLEL=2`. Agent throughput is 35 t/s alone, 26 at `PARALLEL=1`, 19 at `PARALLEL=2`. Peak use is 15.8 GB VRAM with 9.6 GB RAM left available.
+
+### Known problems
+
+- **Qwen 2.5 7B cannot use tools here.** It writes calls as plain text, so `tool_calls` stays empty. As a Claude Code subagent it made no tool calls and once invented file contents that the parent repeated as fact. It is suitable only for tool-free calls.
+- **Qwen3.8 subagents may return an empty final report.** They read files correctly, but the report was empty in 2/2 runs through ccr and 1/2 direct, so the cause is not ccr.
+- **ccr's `think` route sends any request with a `thinking` field to Opus 4.7**, even when it names `claude-sonnet-4-6`. If Claude Code enables thinking, those turns bill as Opus.
+- **Desktop crashes:** nouveau kills gnome-shell's channel (`CTXSW_TIMEOUT`). Software rendering (`AccelMethod none` plus `LIBGL_ALWAYS_SOFTWARE=1`) left the login screen unresponsive and was reverted. Do not add an Xorg `OutputClass` without a `Driver`: it makes Xorg fail with `no screens found`.
 
 ## Architecture (the big picture)
 
@@ -22,7 +48,7 @@ Three services run on the host, each with a fixed role. Get these relationships 
   - `think` → Anthropic Opus 4.7
   - `longContext` (>60 K tokens) → Anthropic Opus 4.7
   Loads custom transformer plugins from `~/.claude-code-router/plugins/`.
-- **Open WebUI** (port `3000`, Docker `--network host`, `--restart always`) — ChatGPT-style UI. Talks directly to `llama-swap` at `http://localhost:8001/v1`, not through `ccr`. Only `ccr` brokers Anthropic traffic.
+- **Open WebUI** (port `3000`, v0.13.0, Docker bridge network, `--restart always`, data in the named volume `open-webui-data`) — ChatGPT-style UI. Talks directly to `llama-swap` at `http://192.168.1.199:8001/v1`, not through `ccr`. Only `ccr` brokers Anthropic traffic.
 
 ### Models registered in llama-swap
 
@@ -56,10 +82,10 @@ The host has **two NVIDIA GPUs**, deliberately split between drivers:
 
 | PCI | GPU | Driver | Role |
 | --- | --- | --- | --- |
-| `03:00.0` | Tesla P100 16 GB (Pascal) | `nvidia` (proprietary 535.x) | CUDA / `llama-server` |
+| `03:00.0` | Tesla P100 16 GB (Pascal) | `nvidia` (`nvidia-headless-no-dkms-580-server`, 580.x) | CUDA / `llama-server` |
 | `04:00.0` | GeForce GT 730 (Kepler) | `nouveau` | Local display only |
 
-The GT 730 is Kepler — the 535 proprietary driver explicitly refuses it (`NVRM: ... will ignore this GPU`), which is fine because `nouveau` drives it for the desktop. `prime-select` is set to `on-demand`. **Do not "fix" this by switching `prime-select` to `nvidia` or installing the 470 legacy driver** — both break CUDA on the P100 (the 7B model silently falls back to CPU at ~7 t/s instead of ~40 t/s).
+The GT 730 is Kepler — the proprietary driver explicitly refuses it (`NVRM: ... will ignore this GPU`), which is fine because `nouveau` drives it for the desktop. `prime-select` is set to `on-demand`. **Do not "fix" this by switching `prime-select` to `nvidia` or installing the 470 legacy driver** — both break CUDA on the P100 (the 7B model silently falls back to CPU at ~7 t/s instead of ~40 t/s).
 
 **`nvidia-persistenced` must be running** for CUDA to work at all. Without it, the `nvidia` kernel module unloads whenever no process holds a handle, and the next `cuInit()` races against the unload and fails with `unknown error` (CUDA error 999). The Ubuntu-shipped unit file is wrong for a server: it has `StopWhenUnneeded=true` and `--no-persistence-mode`. Two drop-ins fix that:
 
@@ -83,12 +109,13 @@ Symptoms that this is broken: `nvidia-smi` looks fine, `qwen2.5-coder-7b` answer
 - `/etc/systemd/system/nvidia-persistenced.service.d/override.conf` — keeps the persistence daemon alive in real persistence mode (load-bearing for CUDA; see the persistence-daemon section above).
 - `/etc/systemd/system/llama-swap.service.d/nvidia-persistenced.conf` — pulls the persistence daemon up as a dependency of llama-swap.
 - `/etc/modprobe.d/gt730-fix.conf` — `nouveau modeset=1` so the GT 730 drives the desktop.
-- `/etc/modprobe.d/nvidia-graphics-drivers-kms.conf` — Ubuntu package-managed, sets `nvidia-drm modeset=0`. Don't add other `NVreg_*` files here without checking `dmesg` for `unknown parameter ... ignored`; the 535 driver silently drops anything it doesn't recognise.
+- `/etc/modprobe.d/nvidia-graphics-drivers-kms.conf` — Ubuntu package-managed, sets `nvidia-drm modeset=0`. Don't add other `NVreg_*` files here without checking `dmesg` for `unknown parameter ... ignored`; the driver silently drops anything it doesn't recognise.
 - `/etc/X11/xorg.conf.d/10-gt730-only.conf` — pins Xorg to the GT 730 (`Driver "modesetting"`, `BusID "PCI:4:0:0"`, `kmsdev=/dev/dri/card0`), and forces `1920x1080` via a `Monitor` + `Screen.Display.Modes` block. The GT 730 is Kepler GK208B with HDMI 1.4 only (~340 MHz pixel clock cap); a 4K display's preferred mode (3840x2160@60Hz, 533 MHz) needs HDMI 2.0/SCDC, so nouveau fails the SCDC handshake (`Failure to read SCDC_TMDS_CONFIG: -6`, `kmsOutp ret:-22`) and the screen stays black even though Xorg reports the modeset succeeded. Without the pin Xorg picks the P100 first by PCI order and dies with `(EE) [drm] Failed to open DRM device for (null): -2` because `nvidia-drm modeset=0`. Use `modesetting`, not the legacy UMS `nouveau` Xorg driver (the latter trips on `xf86EnableIO: failed to enable I/O ports`).
 - `gdm` user must be in groups `video` and `render` (`sudo usermod -aG video,render gdm`) so Xorg launched by gdm can open `/dev/fb0` and `/dev/dri/card0`. Symptom of missing membership: `(EE) open /dev/fb0: Permission denied` in `/var/lib/gdm3/.local/share/xorg/Xorg.0.log` and gdm looping on `GdmDisplay: Session never registered, failing`.
 - `/etc/udev/rules.d/99-hide-p100-from-desktop.rules` strips the P100's `drm` and `graphics` nodes from `seat0` (`TAG-="seat"` + empty `ID_FOR_SEAT`). Without this, logind tries to expose the P100 as a graphics device for any Xorg session and `(EE) systemd-logind: failed to take device /dev/dri/card1: No such device` shows up in the Xorg log; on some boots this escalates from informational to a startup failure.
 - `fix-gpu.service` (oneshot, `Before=display-manager.service`, runs `/usr/local/bin/fix-gpu-drivers.sh`) unbinds the P100 from `nouveau` and `modprobe`s `nvidia` + `nvidia_uvm` before GDM starts. Required because early-boot probing can attach `nouveau` to both GPUs; without this fix-up the P100 sometimes ends up under `nouveau` and CUDA fails until reboot.
 - An older `/etc/X11/xorg.conf.d/00-video.conf` is retained alongside `10-gt730-only.conf`. Its only useful section now is `Device "P100" / Driver "nvidia" / Option "Ignore" "yes"`; the `GT730` and `Screen0` sections it also defines are superseded by `10-gt730-only.conf` because of lexical merge order. Do not delete `00-video.conf` without re-homing the `Ignore` somewhere.
+- `~/ai-setup-docs/scripts/backup.sh` (`ai-backup.timer`, daily 03:00) writes `~/backups/ai-setup/<date>/`, which contains API keys. Only directories with a `COMPLETE` marker count as backups or get pruned. `my-ia-setup-install.sh` holds a copy of the script as a template. Model weights are not backed up.
 - `INVENTORY.md` (in this repo) holds a full snapshot of the live host (hardware, drivers, modprobe, udev, Xorg, systemd, ports, models). Update it when the deployed state changes.
 
 ## Client setup (Windows + Claude Code)
@@ -124,6 +151,8 @@ The Windows client should put **all** AI configuration in `C:\Users\<user>\.clau
 Both `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` point at `claude-haiku-4-5`, which the ccr `local` provider claims and routes to Qwen 7B locally — so haiku-tier internal calls (title generation, prompt expansion, summarization) and subagents without an explicit model are free. Anthropic-issued IDs (`claude-haiku-4-5`) are preferred over passing the raw local model id (`qwen2.5-coder-7b`) so the same `settings.json` keeps working if ccr is bypassed or replaced.
 
 **Pitfalls to actively avoid in this file:**
+
+- `CLAUDE_CODE_SUBAGENT_MODEL` set to a haiku-tier id sends subagents to whatever `local` serves. In the classic layout that is Qwen 2.5 7B, which cannot use tools and can invent results (see Known problems). The configuration above predates this finding and is not a recommendation.
 
 - A top-level `"model": "claude-haiku-4-5"` (or any haiku-tier id) sends every conversation turn through the local Qwen 7B because of the same provider claim. That destroys the Sonnet/Opus balance — only set `model` if you truly want all turns local.
 - `"DISABLE_PROMPT_CACHING": "1"` looks like a cost-saver but is the opposite: it removes Anthropic's ~90% prefix-cache discount, so every Sonnet/Opus turn pays full input cost. Leave prompt caching enabled.

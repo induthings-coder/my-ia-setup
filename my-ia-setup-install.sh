@@ -623,31 +623,116 @@ exit 1
 EOF
   chmod +x "$DOCS_DIR/scripts/healthcheck.sh"
 
-  cat >"$DOCS_DIR/scripts/backup.sh" <<EOF
+  cat >"$DOCS_DIR/scripts/backup.sh" <<'EOF'
 #!/bin/bash
+# Daily backup of the AI stack configuration and Open WebUI data.
+# Targets ~/backups/ai-setup/<YYYY-MM-DD>/ and exits non-zero if any step fails.
+# A backup counts as complete only when it holds the COMPLETE marker.
+# Retention keeps the last 14 complete backups; other directories are never pruned.
+# Backups contain API keys, so everything is private to the owner.
+
 set -euo pipefail
-DEST_ROOT="$TARGET_HOME/backups/ai-setup"
-TODAY="\$(date +%Y-%m-%d)"
-DEST="\$DEST_ROOT/\$TODAY"
+umask 077
+
+DEST_ROOT="$HOME/backups/ai-setup"
+TODAY="$(date +%Y-%m-%d)"
+DEST="$DEST_ROOT/$TODAY"
 RETAIN=14
-mkdir -p "\$DEST"
-[[ -d "$TARGET_HOME/.claude-code-router" ]] && \\
-  tar czf "\$DEST/claude-code-router.tar.gz" -C "$TARGET_HOME" .claude-code-router \\
-    --exclude='.claude-code-router/logs' --exclude='.claude-code-router/.claude-code-router.pid'
-[[ -d "$TARGET_HOME/.config/llama-swap" ]] && \\
-  tar czf "\$DEST/llama-swap.tar.gz" -C "$TARGET_HOME/.config" llama-swap
-for u in llama-swap.service ccr.service ai-healthcheck.service ai-healthcheck.timer ai-backup.service ai-backup.timer; do
-  [[ -r "/etc/systemd/system/\$u" ]] && install -m 0644 "/etc/systemd/system/\$u" "\$DEST/\$u"
-done
-if docker volume inspect open-webui >/dev/null 2>&1; then
-  docker run --rm -v open-webui:/data:ro -v "\$DEST":/backup alpine \\
-    tar czf /backup/open-webui-volume.tar.gz -C /data . >/dev/null
+WEBUI=open-webui
+WEBUI_DATA=/app/backend/data
+WEBUI_TMP=/tmp/ai-backup
+
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+mkdir -p "$DEST"
+chmod 0700 "$DEST"
+rm -f "$DEST/COMPLETE"
+
+# --- ccr config ------------------------------------------------------------
+tar czf "$DEST/claude-code-router.tar.gz" \
+  --exclude='.claude-code-router/logs' \
+  --exclude='.claude-code-router/.claude-code-router.pid' \
+  -C "$HOME" .claude-code-router
+log "ccr config -> claude-code-router.tar.gz"
+
+# --- llama-swap config -----------------------------------------------------
+install -m 0600 "$HOME/.config/llama-swap/config.yaml" "$DEST/llama-swap-config.yaml"
+log "llama-swap config -> llama-swap-config.yaml"
+
+# --- Strata API key --------------------------------------------------------
+if [[ -f "$HOME/strata-poc/strata.env" ]]; then
+  install -m 0600 "$HOME/strata-poc/strata.env" "$DEST/strata.env"
+  log "strata key -> strata.env"
 fi
-chmod 0700 "\$DEST"
-cd "\$DEST_ROOT"
-mapfile -t old < <(ls -1 | sort | head -n -"\$RETAIN")
-for d in "\${old[@]:-}"; do [[ -n "\$d" && -d "\$d" ]] && rm -rf -- "\$d"; done
-echo "Backup complete: \$DEST"
+
+# --- host configuration: units, drop-ins, and the load-bearing GPU files ----
+host_paths=()
+for path in \
+  etc/systemd/system/llama-swap.service \
+  etc/systemd/system/strata.service \
+  etc/systemd/system/llama-swap.service.d \
+  etc/systemd/system/nvidia-persistenced.service.d \
+  etc/systemd/system/ccr.service \
+  etc/systemd/system/fix-gpu.service \
+  etc/systemd/system/ai-healthcheck.service \
+  etc/systemd/system/ai-healthcheck.timer \
+  etc/systemd/system/ai-backup.service \
+  etc/systemd/system/ai-backup.timer \
+  usr/local/bin/fix-gpu-drivers.sh \
+  etc/X11/xorg.conf.d \
+  etc/modprobe.d/gt730-fix.conf \
+  etc/udev/rules.d/99-hide-p100-from-desktop.rules \
+  etc/default/grub \
+  etc/grub.d/40_custom; do
+  if [[ -r "/$path" ]]; then
+    host_paths+=("$path")
+  else
+    log "WARNING: skipped missing or unreadable /$path"
+  fi
+done
+tar czf "$DEST/host-config.tar.gz" -C / "${host_paths[@]}"
+log "host configuration -> host-config.tar.gz (${#host_paths[@]} paths)"
+
+# --- Open WebUI data -------------------------------------------------------
+# Uses SQLite's backup API because webui.db is in WAL mode and a file copy can
+# miss recent data. cache/ is skipped: it holds about 1.1 GB of re-downloadable
+# models. The container's settings are kept because restoring needs its keys.
+if ! docker ps --format '{{.Names}}' | grep -x "$WEBUI" >/dev/null; then
+  log "ERROR: container $WEBUI is not running, its data was not backed up" >&2
+  exit 1
+fi
+cleanup() { docker exec "$WEBUI" rm -rf "$WEBUI_TMP" 2>/dev/null || true; }
+trap cleanup EXIT
+docker exec "$WEBUI" mkdir -p "$WEBUI_TMP"
+docker exec "$WEBUI" python3 -c "
+import sqlite3
+src = sqlite3.connect('file:$WEBUI_DATA/webui.db?mode=ro', uri=True)
+dst = sqlite3.connect('$WEBUI_TMP/webui.db')
+src.backup(dst)
+result = dst.execute('pragma integrity_check').fetchone()[0]
+raise SystemExit(0 if result == 'ok' else 'integrity_check: ' + result)
+"
+docker exec "$WEBUI" tar czf "$WEBUI_TMP/data.tar.gz" \
+  -C "$WEBUI_TMP" webui.db -C "$WEBUI_DATA" uploads vector_db
+docker cp -q "$WEBUI:$WEBUI_TMP/data.tar.gz" "$DEST/open-webui-data.tar.gz"
+tar tzf "$DEST/open-webui-data.tar.gz" | grep -x 'webui.db' >/dev/null
+docker inspect "$WEBUI" > "$DEST/open-webui-container.json"
+log "open-webui data -> open-webui-data.tar.gz"
+
+chmod -R go-rwx "$DEST"
+touch "$DEST/COMPLETE"
+
+# --- retention -------------------------------------------------------------
+cd "$DEST_ROOT"
+mapfile -t complete < <(find . -mindepth 2 -maxdepth 2 -name COMPLETE -printf '%h\n' | sed 's|^\./||' | sort)
+if (( ${#complete[@]} > RETAIN )); then
+  for d in "${complete[@]:0:${#complete[@]}-RETAIN}"; do
+    rm -rf -- "$d"
+    log "pruned $d"
+  done
+fi
+
+log "Backup complete: $DEST"
 EOF
   chmod +x "$DOCS_DIR/scripts/backup.sh"
 

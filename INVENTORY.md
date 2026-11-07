@@ -1,3 +1,5 @@
+> **Snapshot from 2026-05-04; superseded in part.** As of 2026-11-07: 64 GB RAM (4x16 GB), kernel 7.0.0-42, NVIDIA 580.178.04 (`-server` packages), Open WebUI 0.13.0 on the Docker bridge with the volume `open-webui-data`, and the Strata trial described in `CLAUDE.md`. The boot entry `Ubuntu` carries CPU isolation for `vision-ad` (`isolcpus` on 12-17 and 30-35), and `Ubuntu AI (no CPU isolation)` in `/etc/grub.d/40_custom` does not. `ai-backup` does not include model weights, contrary to the recovery notes below.
+
 # System inventory — IA-SERVER (192.168.1.199)
 
 Captured 2026-05-04 against the running host. This file is a snapshot of
